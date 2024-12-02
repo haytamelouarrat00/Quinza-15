@@ -7,13 +7,13 @@ import random
 
 
 class CardGameNet(nn.Module):
-    def __init__(self, state_size, action_size):
+    def __init__(self, state_size, action_size, hidden_size_1, hidden_size_2):
         super(CardGameNet, self).__init__()
 
-        # Neural network for Q-value prediction
-        self.fc1 = nn.Linear(state_size, 128)
-        self.fc2 = nn.Linear(128, 64)
-        self.fc3 = nn.Linear(64, action_size)
+        # Neural network for Q-value prediction with configurable layer sizes
+        self.fc1 = nn.Linear(state_size, hidden_size_1)
+        self.fc2 = nn.Linear(hidden_size_1, hidden_size_2)
+        self.fc3 = nn.Linear(hidden_size_2, action_size)
 
     def forward(self, x):
         x = torch.relu(self.fc1(x))
@@ -22,13 +22,15 @@ class CardGameNet(nn.Module):
 
 
 class DQNAgent:
-    def __init__(self, state_size, action_size):
+    def __init__(self, state_size, action_size, hidden_size_1=128, hidden_size_2=64):
         self.state_size = state_size
         self.action_size = action_size
+        self.hidden_size_1 = hidden_size_1
+        self.hidden_size_2 = hidden_size_2
 
-        # Hyperparameters
-        self.gamma = 0.95  # discount rate
-        self.epsilon = 1.0  # exploration rate
+        # Hyperparameters with default values (will be updated by Optuna)
+        self.gamma = 0.95
+        self.epsilon = 1.0
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.995
         self.learning_rate = 0.001
@@ -39,9 +41,9 @@ class DQNAgent:
         self.Experience = namedtuple('Experience',
                                      ['state', 'action', 'reward', 'next_state', 'done'])
 
-        # Networks
-        self.policy_net = CardGameNet(state_size, action_size)
-        self.target_net = CardGameNet(state_size, action_size)
+        # Initialize networks with specified architecture
+        self.policy_net = CardGameNet(state_size, action_size, hidden_size_1, hidden_size_2)
+        self.target_net = CardGameNet(state_size, action_size, hidden_size_1, hidden_size_2)
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
