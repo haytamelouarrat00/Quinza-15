@@ -1,141 +1,227 @@
 import optuna
+from optuna.trial import TrialState
 import numpy as np
 from datetime import datetime
 import json
-import torch
 import logging
-import os
-from env import SpanishCardGameEnv
-from dqn import DQNAgent
-import trainer
+from pathlib import Path
+import mlflow
+from typing import Dict, Any, Callable
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from functools import partial
 
 
-class OptunaOptimizer:
-    def __init__(self, env_creator, study_name="card_game_optimization"):
+class HyperparameterOptimizer:
+    def __init__(self, config, env_creator: Callable, study_name: str = "card_game_optimization"):
+        """
+        Initialize the hyperparameter optimizer.
+
+        Args:
+            config: Configuration object
+            env_creator: Function that creates the environment
+            study_name: Name for the optimization study
+        """
+        self.config = config
         self.env_creator = env_creator
         self.study_name = study_name
-        logging.basicConfig(level=logging.INFO)
+
+        # Setup logging
+        self.log_dir = Path("logs") / study_name
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(self.log_dir / "optimization.log"),
+                logging.StreamHandler()
+            ]
+        )
         self.logger = logging.getLogger(__name__)
 
+        # Initialize MLflow
+        mlflow.set_experiment(study_name)
+
+        # Create Optuna study with pruning
         self.study = optuna.create_study(
             study_name=study_name,
             direction="maximize",
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=5,
+                n_warmup_steps=20,
+                interval_steps=10
+            ),
             storage=f"sqlite:///{study_name}.db",
             load_if_exists=True
         )
 
-    def objective(self, trial):
+    def suggest_parameters(self, trial: optuna.Trial) -> Dict[str, Any]:
+        """Suggest hyperparameters for the trial."""
         params = {
-            'gamma': trial.suggest_float('gamma', 0.8, 0.999),
-            'epsilon_decay': trial.suggest_float('epsilon_decay', 0.99, 0.9999),
-            'epsilon_min': trial.suggest_float('epsilon_min', 0.01, 0.1),
+            # Network architecture
+            'hidden_size_1': trial.suggest_categorical('hidden_size_1', [64, 128, 256, 512]),
+            'hidden_size_2': trial.suggest_categorical('hidden_size_2', [32, 64, 128, 256]),
+            'dropout_rate': trial.suggest_float('dropout_rate', 0.1, 0.5),
+
+            # Training parameters
             'learning_rate': trial.suggest_loguniform('learning_rate', 1e-5, 1e-2),
-            'batch_size': trial.suggest_categorical('batch_size', [16, 32, 64, 128]),
-            'hidden_size_1': trial.suggest_categorical('hidden_size_1', [64, 128, 256]),
-            'hidden_size_2': trial.suggest_categorical('hidden_size_2', [32, 64, 128]),
+            'batch_size': trial.suggest_categorical('batch_size', [16, 32, 64, 128, 256]),
+            'gamma': trial.suggest_float('gamma', 0.9, 0.999),
+            'target_update_freq': trial.suggest_int('target_update_freq', 5, 20),
+
+            # Exploration parameters
+            'epsilon_decay': trial.suggest_float('epsilon_decay', 0.99, 0.999),
+            'epsilon_min': trial.suggest_float('epsilon_min', 0.01, 0.1),
+
+            # Advanced features
+            'use_double_dqn': trial.suggest_categorical('use_double_dqn', [True, False]),
+            'use_dueling_network': trial.suggest_categorical('use_dueling_network', [True, False]),
+            'use_priority_replay': trial.suggest_categorical('use_priority_replay', [True, False])
         }
 
-        try:
-            env = self.env_creator()
-            agent = DQNAgent(
-                state_size=83,
-                action_size=3,
-                hidden_size_1=params['hidden_size_1'],
-                hidden_size_2=params['hidden_size_2']
-            )
+        if params['use_priority_replay']:
+            params.update({
+                'priority_alpha': trial.suggest_float('priority_alpha', 0.4, 0.8),
+                'priority_beta_start': trial.suggest_float('priority_beta_start', 0.3, 0.7)
+            })
 
-            # Update other hyperparameters
-            agent.gamma = params['gamma']
-            agent.epsilon_decay = params['epsilon_decay']
-            agent.epsilon_min = params['epsilon_min']
-            agent.learning_rate = params['learning_rate']
-            agent.batch_size = params['batch_size']
-            agent.optimizer = torch.optim.Adam(
-                agent.policy_net.parameters(),
-                lr=params['learning_rate']
-            )
+        return params
 
-            metrics = self.train_and_evaluate(env, agent, params)
-            trial.report(metrics['win_rate'], step=100)
+    def objective(self, trial: optuna.Trial) -> float:
+        """Objective function for optimization."""
+        # Get hyperparameters for this trial
+        params = self.suggest_parameters(trial)
 
-            if trial.should_prune():
+        # Start MLflow run
+        with mlflow.start_run(nested=True):
+            # Log parameters
+            mlflow.log_params(params)
+
+            try:
+                # Create environment and agent
+                env = self.env_creator()
+                agent = self._create_agent(params)
+
+                # Train and evaluate
+                metrics = self._train_and_evaluate(env, agent, params, trial)
+
+                # Log metrics
+                mlflow.log_metrics(metrics)
+
+                # Report intermediate value for pruning
+                trial.report(metrics['win_rate'], step=100)
+
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+
+                return metrics['win_rate']
+
+            except Exception as e:
+                self.logger.error(f"Error in trial: {str(e)}")
                 raise optuna.TrialPruned()
 
-            return metrics['win_rate']
+    def _train_and_evaluate(self, env, agent, params: Dict[str, Any], trial: optuna.Trial) -> Dict[str, float]:
+        """Train and evaluate the agent with given parameters."""
+        n_episodes = self.config.training.num_episodes
+        eval_episodes = self.config.training.num_eval_episodes
 
-        except Exception as e:
-            self.logger.error(f"Error in trial: {e}")
-            raise optuna.TrialPruned()
-
-    def train_and_evaluate(self, env, agent, params, n_episodes=500, eval_episodes=50):
         # Training phase
+        train_rewards = []
+        eval_metrics = []
+
         for episode in range(n_episodes):
-            state = env.reset()
-            state = agent.encode_state(state)
-            done = False
+            # Training episode
+            episode_reward = self._run_episode(env, agent, training=True)
+            train_rewards.append(episode_reward)
 
-            while not done:
-                legal_actions = env.get_legal_actions()
-                action = agent.act(state, legal_actions)
-                next_state_dict, reward, done, _ = env.step(action)
-                next_state = agent.encode_state(next_state_dict)
-                agent.remember(state, action, reward, next_state, done)
-                agent.replay()
-                state = next_state
+            # Periodic evaluation
+            if episode % self.config.training.eval_frequency == 0:
+                eval_metrics.append(self._evaluate_agent(env, agent, eval_episodes))
 
-        return self.evaluate_agent(env, agent, eval_episodes)
+                # Report intermediate values
+                trial.report(eval_metrics[-1]['win_rate'], step=episode)
 
-    def evaluate_agent(self, env, agent, n_episodes):
-        total_reward = 0
-        wins = 0
-        original_epsilon = agent.epsilon
-        agent.epsilon = agent.epsilon_min
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
 
-        for _ in range(n_episodes):
-            state = env.reset()
-            state = agent.encode_state(state)
-            episode_reward = 0
-            done = False
+        # Final evaluation
+        final_metrics = self._evaluate_agent(env, agent, eval_episodes)
 
-            while not done:
-                legal_actions = env.get_legal_actions()
-                action = agent.act(state, legal_actions)
-                next_state_dict, reward, done, _ = env.step(action)
-                next_state = agent.encode_state(next_state_dict)
-                episode_reward += reward
-                state = next_state
-
-            total_reward += episode_reward
-            player_cards = [len(cards) for cards in env.collected_cards]
-            if player_cards[0] == max(player_cards):
-                wins += 1
-
-        agent.epsilon = original_epsilon
         return {
-            'average_reward': total_reward / n_episodes,
-            'win_rate': wins / n_episodes
+            'win_rate': final_metrics['win_rate'],
+            'average_reward': final_metrics['average_reward'],
+            'training_stability': np.std(train_rewards),
+            'final_epsilon': agent.epsilon
         }
 
-    def optimize(self, n_trials=100):
+    def optimize(self, n_trials: int = 100) -> Dict[str, Any]:
+        """Run the optimization process."""
         self.logger.info(f"Starting optimization with {n_trials} trials")
-        self.study.optimize(self.objective, n_trials=n_trials, callbacks=[self.log_callback])
 
-        best_params = self.study.best_params
-        best_value = self.study.best_value
+        # Create study callback for live plotting
+        plot_callback = partial(self._plot_optimization_history, log_dir=self.log_dir)
 
-        self.logger.info(f"Best params found: {best_params}")
-        self.logger.info(f"Best value achieved: {best_value}")
-        self.save_results()
-        return best_params
+        try:
+            self.study.optimize(
+                self.objective,
+                n_trials=n_trials,
+                callbacks=[self._log_callback, plot_callback]
+            )
 
-    def log_callback(self, study, trial):
-        if trial.value is not None:
-            self.logger.info(f"Trial {trial.number}")
-            self.logger.info(f"Value: {trial.value}")
-            self.logger.info(f"Params: {trial.params}")
+            # Save and analyze results
+            best_params = self.study.best_params
+            self._save_study_results()
+            self._analyze_study()
 
-    def save_results(self):
+            return best_params
+
+        except KeyboardInterrupt:
+            self.logger.info("Optimization interrupted by user")
+            self._save_study_results()
+            return self.study.best_params
+
+    def _analyze_study(self) -> None:
+        """Analyze and visualize study results."""
+        # Create importance plot
+        fig = optuna.visualization.plot_param_importances(self.study)
+        fig.write_image(str(self.log_dir / "param_importance.png"))
+
+        # Create correlation plot
+        fig = optuna.visualization.plot_parallel_coordinate(self.study)
+        fig.write_image(str(self.log_dir / "param_correlation.png"))
+
+        # Analyze parameter distributions
+        param_history = pd.DataFrame([
+            {**t.params, 'value': t.value}
+            for t in self.study.trials if t.state == TrialState.COMPLETE
+        ])
+
+        self._plot_parameter_distributions(param_history)
+
+    def _plot_parameter_distributions(self, param_history: pd.DataFrame) -> None:
+        """Plot distributions of parameters for completed trials."""
+        numeric_params = param_history.select_dtypes(include=[np.number]).columns
+
+        fig, axes = plt.subplots(
+            nrows=len(numeric_params),
+            ncols=1,
+            figsize=(10, 4 * len(numeric_params))
+        )
+
+        for ax, param in zip(axes, numeric_params):
+            sns.histplot(data=param_history, x=param, ax=ax)
+            ax.set_title(f'Distribution of {param}')
+
+        plt.tight_layout()
+        plt.savefig(self.log_dir / "parameter_distributions.png")
+        plt.close()
+
+    def _save_study_results(self) -> None:
+        """Save study results to file."""
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
         results = {
             'best_params': self.study.best_params,
             'best_value': self.study.best_value,
@@ -145,49 +231,47 @@ class OptunaOptimizer:
                     'number': t.number,
                     'params': t.params,
                     'value': t.value,
+                    'state': str(t.state)
                 }
-                for t in self.study.trials if t.value is not None
+                for t in self.study.trials
             ]
         }
 
-        filename = f'optuna_results_{timestamp}.json'
-        with open(filename, 'w') as f:
+        results_file = self.log_dir / f'results_{timestamp}.json'
+        with open(results_file, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2)
+
+    @staticmethod
+    def _log_callback(study: optuna.Study, trial: optuna.Trial) -> None:
+        """Callback for logging trial results."""
+        if trial.value is not None:
+            logging.info(f"Trial {trial.number}")
+            logging.info(f"Value: {trial.value}")
+            logging.info(f"Params: {trial.params}")
+
+    @staticmethod
+    def _plot_optimization_history(study: optuna.Study, trial: optuna.Trial, log_dir: Path) -> None:
+        """Plot optimization history after each trial."""
+        fig = optuna.visualization.plot_optimization_history(study)
+        fig.write_image(str(log_dir / "optimization_history.png"))
 
 
 def main():
-    def env_creator():
-        return SpanishCardGameEnv(num_players=4)
+    """Main function for running hyperparameter optimization."""
+    from config import get_default_config
 
-    optimizer = OptunaOptimizer(env_creator)
+    config = get_default_config()
+
+    def env_creator():
+        from env import SpanishCardGameEnv
+        return SpanishCardGameEnv(config)
+
+    optimizer = HyperparameterOptimizer(config, env_creator)
     best_params = optimizer.optimize(n_trials=50)
 
     print("\nOptimization completed!")
     print("Best parameters found:")
     print(json.dumps(best_params, indent=2))
-
-    # Create agent with best parameters
-    env = env_creator()
-    agent = DQNAgent(
-        state_size=83,
-        action_size=3,
-        hidden_size_1=best_params['hidden_size_1'],
-        hidden_size_2=best_params['hidden_size_2']
-    )
-
-    # Update other hyperparameters
-    agent.gamma = best_params['gamma']
-    agent.epsilon_decay = best_params['epsilon_decay']
-    agent.epsilon_min = best_params['epsilon_min']
-    agent.learning_rate = best_params['learning_rate']
-    agent.batch_size = best_params['batch_size']
-    agent.optimizer = torch.optim.Adam(
-        agent.policy_net.parameters(),
-        lr=best_params['learning_rate']
-    )
-
-    # Train the agent with best parameters
-    trainer.train_agent(env, agent, num_episodes=1000)
 
 
 if __name__ == "__main__":
